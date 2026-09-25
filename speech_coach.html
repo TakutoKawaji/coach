@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>聞きやすい話し方コーチ</title>
+<style>
+  :root{
+    --bg:#121218; --fg:#c8c8d2; --sub:#8c8c96; --accent:#5ac8ff;
+    --btn:#4682c8; --btn-off:#3c3c46;
+    padding-top:env(safe-area-inset-top,0px);
+    padding-bottom:env(safe-area-inset-bottom,0px);
+  }
+  @media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){ --bg:#121218; --fg:#c8c8d2; } }
+  :root[data-theme="dark"]{ --bg:#121218; --fg:#c8c8d2; }
+  html{ scroll-padding-top:env(safe-area-inset-top,0px); }
+  *{ box-sizing:border-box; }
+  body{
+    margin:0; background:var(--bg); color:var(--fg); font-family:"Hiragino Sans","Noto Sans JP",sans-serif;
+    display:flex; flex-direction:column; align-items:center; min-height:100vh; padding:16px;
+  }
+  h1{ font-size:16px; font-weight:500; color:var(--fg); text-align:center; margin:8px 0 4px; }
+  #canvasWrap{ width:100%; max-width:900px; overflow-x:auto; }
+  canvas{ display:block; width:100%; max-width:900px; height:auto; touch-action:none; }
+  #info{ font-size:13px; color:var(--sub); text-align:center; margin-top:6px; min-height:18px; }
+  #legend{ font-size:12px; color:var(--sub); text-align:center; line-height:1.6; margin-top:4px; }
+  #recBtn{
+    margin-top:18px; padding:16px 36px; font-size:16px; border:none; border-radius:14px;
+    background:var(--btn); color:#fff; user-select:none; -webkit-user-select:none; touch-action:none;
+  }
+  #recBtn.recording{ background:#c84646; }
+  #recBtn:disabled{ background:var(--btn-off); }
+  #warning{ display:none; margin-top:12px; color:#ffb060; font-size:13px; text-align:center; max-width:600px; }
+</style>
+</head>
+<body>
+  <h1>録音ボタンを押しながら発話してください</h1>
+  <div id="canvasWrap"><canvas id="canvas" width="900" height="420"></canvas></div>
+  <div id="info"></div>
+  <button id="recBtn">押しながら発話</button>
+  <div id="legend">
+    文字が太い = 声が大きい　文字が大きい = 話すのが速い<br>
+    文字が薄い = 聞き取りにくい　文字が上にずれる = 抑揚が高い
+  </div>
+  <div id="warning">お使いのブラウザは音声認識に対応していません。Chromeでお試しください。</div>
+
+<script>
+const TARGET_PHRASE = "おとうさん";
+const SMALL_KANA = new Set("ゃゅょぁぃぅぇぉャュョァィゥェォ".split(""));
+const SCALE_MIN=0.65, SCALE_MAX=1.6, BOLD_MIN=0, BOLD_MAX=5, ALPHA_MIN=0.28, ALPHA_MAX=1.0, YSHIFT_MAX=30;
+const BASE_FONT_SIZE=52;
+
+function kataToHira(s){ return s.replace(/[\u30a1-\u30f6]/g, c=>String.fromCharCode(c.charCodeAt(0)-0x60)); }
+function splitMora(text){
+  const mora=[]; let i=0;
+  while(i<text.length){
+    const c=text[i];
+    if(i+1<text.length && SMALL_KANA.has(text[i+1])){ mora.push(text.slice(i,i+2)); i+=2; }
+    else { mora.push(c); i+=1; }
+  }
+  return mora;
+}
+
+const canvas=document.getElementById('canvas'), ctx=canvas.getContext('2d');
+const infoEl=document.getElementById('info'), recBtn=document.getElementById('recBtn'), warnEl=document.getElementById('warning');
+const targetMora=splitMora(TARGET_PHRASE);
+
+let state='wait'; // wait | recording | analyzing | result
+let audioCtx=null, mediaStream=null, sourceNode=null, procNode=null, chunks=[];
+let sampleRate=44100;
+let recognizedText="", recognizedMora=[], normFeatures=[];
+let recognition=null, recognitionText=null, recognitionDone=false, audioDone=false, pendingSamples=null;
+
+const SR_SUPPORTED = ('SpeechRecognition' in window) || ('webkitSpeechRecognition' in window);
+if(!SR_SUPPORTED){ warnEl.style.display='block'; recBtn.disabled=true; }
+
+function estimatePitch(seg, sr){
+  const minLag=Math.floor(sr/500), maxLag=Math.floor(sr/80);
+  if(seg.length < maxLag*2) return 0;
+  let best=-1, bestCorr=0;
+  for(let lag=minLag; lag<=maxLag; lag++){
+    let corr=0;
+    for(let i=0;i<seg.length-lag;i++) corr+=seg[i]*seg[i+lag];
+    if(corr>bestCorr){ bestCorr=corr; best=lag; }
+  }
+  return best>0 ? sr/best : 0;
+}
+function trimSilence(y, thresh=0.02){
+  let start=0, end=y.length;
+  for(let i=0;i<y.length;i++){ if(Math.abs(y[i])>thresh){ start=i; break; } }
+  for(let i=y.length-1;i>=0;i--){ if(Math.abs(y[i])>thresh){ end=i+1; break; } }
+  return [start,end];
+}
+function analyze(y, sr, nMora){
+  let [start,end]=trimSilence(y);
+  if(nMora===0 || end-start < sr*0.05){ start=0; end=y.length; }
+  const voiced=y.slice(start,end);
+  if(voiced.length<10 || nMora===0) return [];
+  const segLen=Math.max(1, Math.floor(voiced.length/nMora));
+  const results=[];
+  for(let i=0;i<nMora;i++){
+    const s=i*segLen, e = i===nMora-1 ? voiced.length : (i+1)*segLen;
+    const seg=voiced.slice(s,e);
+    const dur=(e-s)/sr;
+    let sumSq=0; for(let j=0;j<seg.length;j++) sumSq+=seg[j]*seg[j];
+    const rms=Math.sqrt(sumSq/Math.max(1,seg.length));
+    let zc=0; for(let j=1;j<seg.length;j++) if((seg[j-1]>=0)!==(seg[j]>=0)) zc++;
+    const zcr = seg.length>1 ? zc/seg.length : 0;
+    const f0=estimatePitch(seg, sr);
+    results.push({rms,dur,zcr,f0});
+  }
+  return results;
+}
+function normalizeFeatures(feats){
+  if(!feats.length) return [];
+  const rmsVals=feats.map(f=>f.rms);
+  const durVals=feats.map(f=>f.dur).filter(d=>d>0);
+  const zcrVals=feats.map(f=>f.zcr);
+  const f0Vals=feats.map(f=>f.f0).filter(v=>v>0);
+  const maxRms=Math.max(...rmsVals,1e-9);
+  const avgDur=durVals.length ? durVals.reduce((a,b)=>a+b,0)/durVals.length : 0.2;
+  let minZ=Math.min(...zcrVals), maxZ=Math.max(...zcrVals);
+  if(maxZ-minZ<1e-6) maxZ=minZ+1e-6;
+  const meanF0 = f0Vals.length ? f0Vals.reduce((a,b)=>a+b,0)/f0Vals.length : 0;
+  const maxDev = f0Vals.length ? Math.max(...f0Vals.map(v=>Math.abs(v-meanF0)),1e-6) : 1;
+  return feats.map(f=>{
+    const volume = maxRms>0 ? f.rms/maxRms : 0;
+    let speed = f.dur>0 ? avgDur/f.dur : 1.0;
+    speed = Math.min(2.0, Math.max(0.5, speed));
+    let clarity = 1.0 - (f.zcr-minZ)/(maxZ-minZ);
+    clarity = Math.min(1, Math.max(0, clarity));
+    let pitch = (f.f0>0 && meanF0>0) ? (f.f0-meanF0)/maxDev : 0;
+    pitch = Math.min(1, Math.max(-1, pitch));
+    return {volume,speed,clarity,pitch};
+  });
+}
+
+function drawOutlineRow(moraList, yCenter){
+  ctx.font = `${BASE_FONT_SIZE}px "Hiragino Sans","Noto Sans JP",sans-serif`;
+  ctx.textBaseline='middle';
+  const widths=moraList.map(c=>ctx.measureText(c).width);
+  const gap=12;
+  const totalW = widths.reduce((a,b)=>a+b,0) + gap*(widths.length-1);
+  let x = canvas.width/2 - totalW/2;
+  for(let i=0;i<moraList.length;i++){
+    const c=moraList[i], w=widths[i];
+    ctx.lineWidth=5; ctx.strokeStyle='#ffffff'; ctx.globalAlpha=1;
+    ctx.strokeText(c, x+w/2, yCenter);
+    ctx.fillStyle=getComputedStyle(document.body).getPropertyValue('--bg') || '#121218';
+    ctx.fillText(c, x+w/2, yCenter);
+    x += w+gap;
+  }
+}
+function drawStyledRow(moraList, styles, yCenter){
+  ctx.textBaseline='middle';
+  const gap=14;
+  const infos = moraList.map((c,i)=>{
+    const st=styles[i];
+    const scale = Math.min(SCALE_MAX, Math.max(SCALE_MIN, SCALE_MIN + (SCALE_MAX-SCALE_MIN)*((st.speed-0.5)/1.5)));
+    const size = Math.max(10, Math.round(BASE_FONT_SIZE*scale));
+    ctx.font = `${size}px "Hiragino Sans","Noto Sans JP",sans-serif`;
+    const w = ctx.measureText(c).width;
+    return {c, st, size, w};
+  });
+  const totalW = infos.reduce((a,inf)=>a+inf.w,0) + gap*(infos.length-1);
+  let x = canvas.width/2 - totalW/2;
+  for(const inf of infos){
+    ctx.font = `${inf.size}px "Hiragino Sans","Noto Sans JP",sans-serif`;
+    const bold = BOLD_MIN + (BOLD_MAX-BOLD_MIN)*inf.st.volume;
+    const alpha = ALPHA_MIN + (ALPHA_MAX-ALPHA_MIN)*inf.st.clarity;
+    const yShift = -inf.st.pitch*YSHIFT_MAX;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#5ac8ff';
+    ctx.strokeStyle = '#5ac8ff';
+    ctx.lineWidth = bold;
+    const cx = x+inf.w/2, cy = yCenter+yShift;
+    if(bold>0.3) ctx.strokeText(inf.c, cx, cy);
+    ctx.fillText(inf.c, cx, cy);
+    ctx.globalAlpha=1;
+    x += inf.w+gap;
+  }
+}
+function render(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const outlineY = canvas.height/2 - 20;
+  drawOutlineRow(targetMora, outlineY);
+  if(state==='result'){
+    drawStyledRow(recognizedMora, normFeatures, outlineY);
+  }
+}
+function updateInfo(){
+  if(state==='analyzing'){ infoEl.textContent='解析中...(認識→特徴量計算)'; }
+  else if(state==='result'){
+    infoEl.textContent = `認識結果: 「${recognizedText}」`;
+  } else { infoEl.textContent=''; }
+}
+function updateButton(){
+  recBtn.classList.toggle('recording', state==='recording');
+  if(state==='recording'){ recBtn.textContent='● 録音中 (離して終了)'; recBtn.disabled=false; }
+  else if(state==='analyzing'){ recBtn.textContent='解析中...'; recBtn.disabled=true; }
+  else { recBtn.textContent = state==='result' ? 'もう一度録音' : '押しながら発話'; recBtn.disabled=false; }
+}
+function setState(s){ state=s; updateInfo(); updateButton(); render(); }
+
+async function startRecording(){
+  if(state==='recording' || state==='analyzing') return;
+  try{
+    mediaStream = await navigator.mediaDevices.getUserMedia({audio:true});
+  }catch(e){ infoEl.textContent='マイクへのアクセスが許可されませんでした'; return; }
+  audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+  sampleRate = audioCtx.sampleRate;
+  sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+  procNode = audioCtx.createScriptProcessor(4096,1,1);
+  chunks=[];
+  procNode.onaudioprocess = (e)=>{ chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+  sourceNode.connect(procNode);
+  procNode.connect(audioCtx.destination);
+
+  recognitionDone=false; audioDone=false; recognitionText=null; pendingSamples=null;
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  recognition = new SR();
+  recognition.lang='ja-JP'; recognition.continuous=false; recognition.interimResults=false;
+  recognition.onresult = (ev)=>{ recognitionText = ev.results[0][0].transcript; };
+  recognition.onerror = ()=>{ recognitionText = recognitionText || ""; };
+  recognition.onend = ()=>{ recognitionDone=true; tryFinishAnalysis(); };
+  recognition.start();
+
+  setState('recording');
+}
+function stopRecording(){
+  if(state!=='recording') return;
+  try{ procNode.disconnect(); sourceNode.disconnect(); }catch(e){}
+  try{ mediaStream.getTracks().forEach(t=>t.stop()); }catch(e){}
+  let total=0; for(const c of chunks) total+=c.length;
+  const samples = new Float32Array(total);
+  let off=0; for(const c of chunks){ samples.set(c, off); off+=c.length; }
+  pendingSamples = {samples, sr: sampleRate};
+  audioDone=true;
+  try{ recognition.stop(); }catch(e){ recognitionDone=true; }
+  setState('analyzing');
+  tryFinishAnalysis();
+}
+function tryFinishAnalysis(){
+  if(!(audioDone && recognitionDone)) return;
+  const rawText = recognitionText || "";
+  const hira = kataToHira(rawText);
+  const recMora = splitMora(hira);
+  const feats = analyze(pendingSamples.samples, pendingSamples.sr, recMora.length);
+  const norm = normalizeFeatures(feats);
+  recognizedText = rawText; recognizedMora = recMora; normFeatures = norm;
+  setState('result');
+}
+
+recBtn.addEventListener('mousedown', startRecording);
+recBtn.addEventListener('mouseup', stopRecording);
+recBtn.addEventListener('mouseleave', ()=>{ if(state==='recording') stopRecording(); });
+recBtn.addEventListener('touchstart', (e)=>{ e.preventDefault(); startRecording(); });
+recBtn.addEventListener('touchend', (e)=>{ e.preventDefault(); stopRecording(); });
+
+setState('wait');
+</script>
+</body>
+</html>
