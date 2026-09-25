@@ -239,7 +239,8 @@ const USER_COLOR = [90, 200, 255];
 const BG_COLOR = "#121218";
 
 // 音量→太さ: 声の大きさにそのまま比例して文字の太さが変わる
-const BOLD_MIN = 0.6, BOLD_MAX = 24;
+// 太さ(canvasのlineWidth, px)は声の大きさ(0〜1)に対して完全に線形。0で細い線、1で文字が潰れて読めないほど太くなる
+const BOLD_MIN = 0.5, BOLD_MAX = 40;
 const SCALE_MIN = 0.65, SCALE_MAX = 1.6;
 const ALPHA_MIN = 0.28, ALPHA_MAX = 1.0;
 const YSHIFT_MAX = 34;
@@ -569,51 +570,36 @@ function setupCanvas() {
 let lastRecognizedMora = [];
 let lastNormFeatures = [];
 
-function drawOutlineRow(moraList, yCenter, width) {
+function drawOutlineRow(moraList, yCenter, leftX) {
   ctx.font = `900 ${BASE_FONT_SIZE}px "Noto Sans JP", sans-serif`;
   ctx.textBaseline = "middle";
-  ctx.textAlign = "center";
-  const widths = moraList.map((c) => ctx.measureText(c).width);
-  const gap = 10;
-  const totalW = widths.reduce((a, b) => a + b, 0) + gap * Math.max(0, widths.length - 1);
-  let x = width / 2 - totalW / 2;
+  ctx.textAlign = "left";
   ctx.lineJoin = "round";
+  let x = leftX;
   for (let i = 0; i < moraList.length; i++) {
     const c = moraList[i];
-    const w = widths[i];
     ctx.lineWidth = 6;
     ctx.strokeStyle = OUTLINE_COLOR;
-    ctx.strokeText(c, x + w / 2, yCenter);
+    ctx.strokeText(c, x, yCenter);
     ctx.fillStyle = BG_COLOR;
-    ctx.fillText(c, x + w / 2, yCenter);
-    x += w + gap;
+    ctx.fillText(c, x, yCenter);
+    x += ctx.measureText(c).width + 10;
   }
-  ctx.textAlign = "start";
 }
 
-function drawStyledRow(moraList, styles, yCenter, width) {
+function drawStyledRow(moraList, styles, yCenter, leftX) {
   ctx.textBaseline = "middle";
-  ctx.textAlign = "center";
+  ctx.textAlign = "left";
   ctx.lineJoin = "round";
 
-  // まず幅を仮測定(スケール反映後のフォントで)
-  const metrics = moraList.map((ch, i) => {
+  let x = leftX;
+  for (let i = 0; i < moraList.length; i++) {
+    const ch = moraList[i];
     const st = styles[i] || { speed: 1, volume: 0, clarity: 1, pitch: 0 };
     const scale = SCALE_MIN + (SCALE_MAX - SCALE_MIN) * Math.min(Math.max((st.speed - 0.5) / 1.5, 0), 1);
     const size = Math.max(10, Math.round(BASE_FONT_SIZE * scale));
-    ctx.font = `700 ${size}px "Noto Sans JP", sans-serif`;
-    const w = ctx.measureText(ch).width;
-    return { size, w, st };
-  });
-
-  const gap = 14;
-  const totalW = metrics.reduce((a, m) => a + m.w, 0) + gap * Math.max(0, metrics.length - 1);
-  let x = width / 2 - totalW / 2;
-
-  for (let i = 0; i < moraList.length; i++) {
-    const ch = moraList[i];
-    const { size, w, st } = metrics[i];
-    const boldN = (BOLD_MIN + (BOLD_MAX - BOLD_MIN) * st.volume) * (size / BASE_FONT_SIZE);
+    // 太さは声の大きさ(volume)だけに比例する単純な線形関係
+    const boldN = BOLD_MIN + (BOLD_MAX - BOLD_MIN) * st.volume;
     const alpha = ALPHA_MIN + (ALPHA_MAX - ALPHA_MIN) * st.clarity;
     const yShift = -st.pitch * YSHIFT_MAX;
 
@@ -622,12 +608,11 @@ function drawStyledRow(moraList, styles, yCenter, width) {
     ctx.strokeStyle = `rgb(${USER_COLOR.join(",")})`;
     ctx.fillStyle = `rgb(${USER_COLOR.join(",")})`;
     ctx.lineWidth = boldN;
-    const cx = x + w / 2;
     const cy = yCenter + yShift;
-    ctx.strokeText(ch, cx, cy);
-    ctx.fillText(ch, cx, cy);
+    ctx.strokeText(ch, x, cy);
+    ctx.fillText(ch, x, cy);
     ctx.globalAlpha = 1;
-    x += w + gap;
+    x += ctx.measureText(ch).width + 14;
   }
 }
 
@@ -636,9 +621,10 @@ function render() {
   const height = canvas.height / DPR;
   ctx.clearRect(0, 0, width, height);
   const outlineY = height / 2 - 10;
-  drawOutlineRow(targetMora, outlineY, width);
+  const leftX = 20; // 両方の行を同じ左端から描画して、行ごとのズレをなくす
+  drawOutlineRow(targetMora, outlineY, leftX);
   if (lastRecognizedMora.length) {
-    drawStyledRow(lastRecognizedMora, lastNormFeatures, outlineY, width);
+    drawStyledRow(lastRecognizedMora, lastNormFeatures, outlineY, leftX);
   }
 }
 
@@ -681,114 +667,4 @@ async function beginRecording() {
   statusLine.textContent = "";
   resultLine.textContent = "";
   try {
-    recorder = new Recorder();
-    await recorder.start();
-  } catch (err) {
-    statusLine.textContent = "マイクを使用できませんでした。ブラウザの権限設定を確認してください。";
-    console.error(err);
-    return;
-  }
-
-  recognizedText = "";
-  recognitionDone = !hasSpeechRecognition;
-  if (hasSpeechRecognition) {
-    recognizer = createRecognizer();
-    recognizer.onresult = (e) => {
-      if (e.results && e.results[0] && e.results[0][0]) {
-        recognizedText = e.results[0][0].transcript;
-      }
-    };
-    recognizer.onerror = () => { recognitionDone = true; };
-    recognizer.onend = () => {
-      recognitionDone = true;
-      if (recognitionResultPromiseResolve) { recognitionResultPromiseResolve(); recognitionResultPromiseResolve = null; }
-    };
-    try { recognizer.start(); } catch (e) { recognitionDone = true; }
-  }
-
-  isRecording = true;
-  recBtn.textContent = "● 録音中 (離して終了)";
-  recBtn.classList.add("recording");
-}
-
-async function endRecordingAndAnalyze() {
-  if (!isRecording) return;
-  isRecording = false;
-  isBusy = true;
-  recBtn.classList.remove("recording");
-  recBtn.classList.add("busy");
-  recBtn.textContent = "解析中...";
-  statusLine.textContent = "解析中...(認識→特徴量計算)";
-
-  const { samples, sampleRate } = recorder.stop();
-
-  if (hasSpeechRecognition && recognizer) {
-    try { recognizer.stop(); } catch (e) {}
-    if (!recognitionDone) {
-      await new Promise((resolve) => {
-        recognitionResultPromiseResolve = resolve;
-        setTimeout(resolve, 2500); // 認識が長引いた場合のフォールバック
-      });
-    }
-  }
-
-  const rawText = recognizedText || (hasSpeechRecognition ? "" : targetPhrase);
-  const hira = toHiragana(rawText || "");
-  const recMora = hira ? splitMora(hira) : [];
-
-  let feats, norm, ratio;
-  if (recMora.length > 0) {
-    feats = analyze(samples, sampleRate, recMora.length);
-    norm = normalizeFeatures(feats);
-    ratio = matchRatio(targetMora, recMora);
-  } else {
-    // 認識できなかった場合でも、お手本のモーラ数で解析だけは行う
-    const fallbackMora = targetMora;
-    feats = analyze(samples, sampleRate, fallbackMora.length);
-    norm = normalizeFeatures(feats);
-    lastRecognizedMora = fallbackMora;
-    lastNormFeatures = norm;
-    statusLine.textContent = "";
-    resultLine.textContent = hasSpeechRecognition
-      ? "音声を認識できませんでした(無音・雑音の可能性)。お手本の文字数で解析結果のみ表示しています。"
-      : "このブラウザは音声認識に対応していません。お手本の文字数で解析結果のみ表示しています。";
-    render();
-    finishBusy();
-    return;
-  }
-
-  lastRecognizedMora = recMora;
-  lastNormFeatures = norm;
-  statusLine.textContent = "";
-  resultLine.textContent = `認識結果: 「${rawText}」　一致度目安: ${Math.round(ratio * 100)}%`;
-  render();
-  finishBusy();
-}
-
-function finishBusy() {
-  isBusy = false;
-  recBtn.classList.remove("busy");
-  recBtn.textContent = "もう一度録音";
-}
-
-// マウス操作
-recBtn.addEventListener("mousedown", (e) => { e.preventDefault(); beginRecording(); });
-window.addEventListener("mouseup", () => { if (isRecording) endRecordingAndAnalyze(); });
-
-// タッチ操作(スマートフォン)
-recBtn.addEventListener("touchstart", (e) => { e.preventDefault(); beginRecording(); }, { passive: false });
-window.addEventListener("touchend", () => { if (isRecording) endRecordingAndAnalyze(); });
-window.addEventListener("touchcancel", () => { if (isRecording) endRecordingAndAnalyze(); });
-
-if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-  recBtn.classList.add("disabled");
-  recBtn.textContent = "マイク非対応";
-  statusLine.textContent = "このブラウザ・環境ではマイク録音がサポートされていません。";
-}
-
-/* 初期化 */
-setupCanvas();
-render();
-</script>
-</body>
-</html>
+    recorder = new Recorder
