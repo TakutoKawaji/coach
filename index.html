@@ -587,10 +587,15 @@ function drawOutlineRow(moraList, yCenter, leftX) {
   }
 }
 
+// 1文字を不透明で下書きしてから、まとめて1回だけ透明度を適用するための作業用キャンバス。
+// strokeTextとfillTextを別々に半透明で重ねると、境界線だけ濃くなってしまうため、
+// 「不透明で描く→1枚の画像として透明度をかける」ことで文字全体を均一な濃さにする。
+const glyphBuffer = document.createElement("canvas");
+const glyphCtx = glyphBuffer.getContext("2d");
+
 function drawStyledRow(moraList, styles, yCenter, leftX) {
   ctx.textBaseline = "middle";
   ctx.textAlign = "left";
-  ctx.lineJoin = "round";
 
   let x = leftX;
   for (let i = 0; i < moraList.length; i++) {
@@ -604,15 +609,34 @@ function drawStyledRow(moraList, styles, yCenter, leftX) {
     const yShift = -st.pitch * YSHIFT_MAX;
 
     ctx.font = `700 ${size}px "Noto Sans JP", sans-serif`;
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = `rgb(${USER_COLOR.join(",")})`;
-    ctx.fillStyle = `rgb(${USER_COLOR.join(",")})`;
-    ctx.lineWidth = boldN;
+    const w = ctx.measureText(ch).width;
+
+    // --- 1) 作業用キャンバスに不透明(アルファ=1)で文字を描く ---
+    const pad = Math.ceil(boldN) + 6;
+    const bw = Math.ceil(w + pad * 2);
+    const bh = Math.ceil(size * 1.6 + pad * 2);
+    glyphBuffer.width = bw * DPR;
+    glyphBuffer.height = bh * DPR;
+    glyphCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    glyphCtx.clearRect(0, 0, bw, bh);
+    glyphCtx.font = `700 ${size}px "Noto Sans JP", sans-serif`;
+    glyphCtx.textBaseline = "middle";
+    glyphCtx.textAlign = "left";
+    glyphCtx.lineJoin = "round";
+    glyphCtx.globalAlpha = 1;
+    glyphCtx.strokeStyle = `rgb(${USER_COLOR.join(",")})`;
+    glyphCtx.fillStyle = `rgb(${USER_COLOR.join(",")})`;
+    glyphCtx.lineWidth = boldN;
+    glyphCtx.strokeText(ch, pad, bh / 2);
+    glyphCtx.fillText(ch, pad, bh / 2);
+
+    // --- 2) 完成した1枚の絵として、まとめて透明度をかけてメインキャンバスに転写 ---
     const cy = yCenter + yShift;
-    ctx.strokeText(ch, x, cy);
-    ctx.fillText(ch, x, cy);
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(glyphBuffer, 0, 0, bw * DPR, bh * DPR, x - pad, cy - bh / 2, bw, bh);
     ctx.globalAlpha = 1;
-    x += ctx.measureText(ch).width + 14;
+
+    x += w + 14;
   }
 }
 
@@ -635,36 +659,3 @@ window.addEventListener("resize", () => { setupCanvas(); render(); });
 ============================================================ */
 const recBtn = document.getElementById("recBtn");
 const statusLine = document.getElementById("statusLine");
-const resultLine = document.getElementById("resultLine");
-const phraseInput = document.getElementById("phraseInput");
-const setPhraseBtn = document.getElementById("setPhraseBtn");
-
-let recorder = null;
-let recognizer = null;
-let isRecording = false;
-let isBusy = false;
-let recognizedText = "";
-let recognitionDone = false;
-let recognitionResultPromiseResolve = null;
-
-const hasSpeechRecognition = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
-
-setPhraseBtn.addEventListener("click", () => {
-  const v = phraseInput.value.trim();
-  if (!v) return;
-  targetPhrase = v;
-  targetMora = splitMora(targetPhrase);
-  lastRecognizedMora = [];
-  lastNormFeatures = [];
-  resultLine.textContent = "";
-  statusLine.textContent = "";
-  setupCanvas();
-  render();
-});
-
-async function beginRecording() {
-  if (isRecording || isBusy) return;
-  statusLine.textContent = "";
-  resultLine.textContent = "";
-  try {
-    recorder = new Recorder
